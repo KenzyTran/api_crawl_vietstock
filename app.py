@@ -50,11 +50,30 @@ def scrape_codes(target_date):
         current_day_of_week = day_of_week_translation.get(current_day_of_week_english, current_day_of_week_english)
         
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
+            # Cấu hình browser cho Amazon Linux/EC2
+            browser = p.chromium.launch(
+                headless=True,
+                args=[
+                    '--no-sandbox',
+                    '--disable-setuid-sandbox', 
+                    '--disable-dev-shm-usage',
+                    '--disable-web-security',
+                    '--disable-features=VizDisplayCompositor',
+                    '--disable-background-timer-throttling',
+                    '--disable-backgrounding-occluded-windows',
+                    '--disable-renderer-backgrounding'
+                ]
+            )
             page = browser.new_page()
+            
+            # Set user agent để tránh bị block
+            page.set_extra_http_headers({
+                'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            })
+            
             url = f"https://finance.vietstock.vn/lich-su-kien.htm?page=1&tab=1&from={date_str}&to={date_str}&exchange=-1"
             page.goto(url, timeout=60000)
-            page.wait_for_timeout(10000)  # Giảm thời gian chờ
+            page.wait_for_timeout(15000)  # Tăng thời gian chờ để trang load đầy đủ
             page_source = page.content()
             browser.close()
 
