@@ -1,15 +1,16 @@
-from flask import Flask, request, jsonify
+#!/usr/bin/env python3
+import requests
 from playwright.sync_api import sync_playwright
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta
 import os
 import json
-
-app = Flask(__name__)
+import argparse
+import sys
 
 day_of_week_translation = {
     "Monday": "thứ hai",
-    "Tuesday": "thứ ba",
+    "Tuesday": "thứ ba", 
     "Wednesday": "thứ tư",
     "Thursday": "thứ năm",
     "Friday": "thứ sáu",
@@ -17,22 +18,11 @@ day_of_week_translation = {
     "Sunday": "chủ nhật"
 }
 
-def get_target_date(target_type="tomorrow"):
-    now = datetime.now()
-    if target_type == "tomorrow":
-        # Nếu hôm nay là thứ 6 thì ngày mai là thứ 2 (thêm 3 ngày)
-        if now.weekday() == 4:
-            target_date = now + timedelta(days=3)
-        else:
-            target_date = now + timedelta(days=1)
-    elif target_type == "today":
-        target_date = now
-    else:
-        raise ValueError("target_type không hợp lệ!")
-    return target_date
-
-def parse_date_string(date_str):
-    """Parse date string từ nhiều format khác nhau"""
+def parse_date_input(date_str):
+    """
+    Chuyển đổi chuỗi ngày đầu vào thành datetime object
+    Hỗ trợ các format: YYYY-MM-DD, DD/MM/YYYY, DD-MM-YYYY
+    """
     formats = ['%Y-%m-%d', '%d/%m/%Y', '%d-%m-%Y']
     
     for fmt in formats:
@@ -40,49 +30,61 @@ def parse_date_string(date_str):
             return datetime.strptime(date_str, fmt)
         except ValueError:
             continue
-    raise ValueError(f"Không thể parse ngày: {date_str}. Hỗ trợ format: YYYY-MM-DD, DD/MM/YYYY, DD-MM-YYYY")
+    
+    raise ValueError(f"Định dạng ngày không hợp lệ: {date_str}. Vui lòng sử dụng: YYYY-MM-DD, DD/MM/YYYY hoặc DD-MM-YYYY")
 
-def scrape_codes(target_date):
+def get_target_date(target_input=None):
+    """
+    Lấy ngày mục tiêu dựa trên đầu vào
+    target_input có thể là: None (hôm nay), "tomorrow", "yesterday", hoặc ngày cụ thể
+    """
+    now = datetime.now()
+    
+    if target_input is None or target_input.lower() == "today":
+        return now
+    elif target_input.lower() == "tomorrow":
+        if now.weekday() == 4:  # Thứ 6
+            return now + timedelta(days=3)  # Thứ 2 tuần sau
+        else:
+            return now + timedelta(days=1)
+    elif target_input.lower() == "yesterday":
+        if now.weekday() == 0:  # Thứ 2
+            return now - timedelta(days=3)  # Thứ 6 tuần trước
+        else:
+            return now - timedelta(days=1)
+    else:
+        # Coi như là ngày cụ thể
+        return parse_date_input(target_input)
+
+def scrape_stock_events(target_date):
+    """
+    Scrape dữ liệu sự kiện chứng khoán từ VietStock
+    Trả về dictionary chứa thông tin chi tiết
+    """
+    date_str = target_date.strftime("%Y-%m-%d")
+    formatted_date = target_date.strftime("%d/%m/%Y")
+    current_day_of_week_english = target_date.strftime("%A")
+    current_day_of_week = day_of_week_translation.get(current_day_of_week_english, current_day_of_week_english)
+    
     try:
-        date_str = target_date.strftime("%Y-%m-%d")
-        formatted_date = target_date.strftime("%d/%m/%Y")
-        current_day_of_week_english = target_date.strftime("%A")
-        current_day_of_week = day_of_week_translation.get(current_day_of_week_english, current_day_of_week_english)
-        
         with sync_playwright() as p:
-            # Cấu hình browser cho Amazon Linux/EC2
-            browser = p.chromium.launch(
-                headless=True,
-                args=[
-                    '--no-sandbox',
-                    '--disable-setuid-sandbox', 
-                    '--disable-dev-shm-usage',
-                    '--disable-web-security',
-                    '--disable-features=VizDisplayCompositor',
-                    '--disable-background-timer-throttling',
-                    '--disable-backgrounding-occluded-windows',
-                    '--disable-renderer-backgrounding'
-                ]
-            )
+            browser = p.chromium.launch(headless=True)
             page = browser.new_page()
-            
-            # Set user agent để tránh bị block
-            page.set_extra_http_headers({
-                'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-            })
-            
             url = f"https://finance.vietstock.vn/lich-su-kien.htm?page=1&tab=1&from={date_str}&to={date_str}&exchange=-1"
             page.goto(url, timeout=60000)
-            page.wait_for_timeout(15000)  # Tăng thời gian chờ để trang load đầy đủ
+            page.wait_for_timeout(25000)  
             page_source = page.content()
             browser.close()
 
         soup = BeautifulSoup(page_source, 'html.parser')
         table = soup.find('table', id='event-content')
+        
         if not table:
             return {
                 'success': False,
                 'message': f"Không tìm thấy bảng sự kiện cho ngày {formatted_date}",
+                'date': formatted_date,
+                'day_of_week': current_day_of_week,
                 'data': []
             }
         
@@ -91,132 +93,142 @@ def scrape_codes(target_date):
             return {
                 'success': False,
                 'message': f"Không tìm thấy dữ liệu trong bảng cho ngày {formatted_date}",
+                'date': formatted_date,
+                'day_of_week': current_day_of_week,
                 'data': []
             }
         
         rows = tbody.find_all('tr')
         
         events_data = []
-        codes = []
+        stock_codes = []
         
-        for i, row in enumerate(rows):
+        for row in rows:
             cols = row.find_all('td')
             if len(cols) >= 7:
-                stt = i + 1
-                ma_ck = cols[1].get_text(strip=True)
-                san = cols[2].get_text(strip=True)
-                ngay_gdkhq = cols[3].get_text(strip=True)
-                noi_dung = cols[6].get_text(strip=True).split(',', 1)[-1].strip()
-                su_kien = cols[7].get_text(strip=True).split('bằng', 1)[-1].strip().capitalize()
-                
                 event_info = {
-                    'stt': stt,
-                    'ma_ck': ma_ck,
-                    'san': san,
-                    'ngay_gdkhq': ngay_gdkhq,
-                    'noi_dung': noi_dung,
-                    'co_tuc': su_kien
+                    'stt': cols[0].get_text(strip=True),
+                    'ma_ck': cols[1].get_text(strip=True),
+                    'san': cols[2].get_text(strip=True),
+                    'ngay_gdkhq': cols[3].get_text(strip=True),
+                    'noi_dung': cols[6].get_text(strip=True).split(',', 1)[-1].strip(),
+                    'co_tuc': cols[7].get_text(strip=True).split('bằng', 1)[-1].strip().capitalize()
                 }
                 events_data.append(event_info)
-                codes.append(ma_ck)
+                stock_codes.append(event_info['ma_ck'])
         
         return {
             'success': True,
-            'message': f"Lấy dữ liệu thành công cho ngày {formatted_date} ({current_day_of_week})",
+            'message': f"Tìm thấy {len(events_data)} sự kiện cho ngày {formatted_date}",
             'date': formatted_date,
             'day_of_week': current_day_of_week,
             'total_events': len(events_data),
-            'codes': codes,
-            'events': events_data
+            'stock_codes': stock_codes,
+            'data': events_data
         }
-    
+        
     except Exception as e:
         return {
             'success': False,
-            'message': f"Lỗi khi lấy dữ liệu: {str(e)}",
+            'message': f"Lỗi khi scrape dữ liệu: {str(e)}",
+            'date': formatted_date,
+            'day_of_week': current_day_of_week,
             'data': []
         }
 
-@app.route('/', methods=['GET'])
-def home():
-    return jsonify({
-        'message': 'Stock Events API',
-        'endpoints': {
-            '/events': 'GET - Lấy sự kiện theo ngày',
-            '/events/today': 'GET - Lấy sự kiện hôm nay',
-            '/events/tomorrow': 'GET - Lấy sự kiện ngày mai'
-        },
-        'parameters': {
-            'date': 'YYYY-MM-DD, DD/MM/YYYY, hoặc DD-MM-YYYY'
-        }
-    })
+def format_table_output(result_data):
+    """
+    Format dữ liệu thành bảng đẹp mắt để hiển thị
+    """
+    if not result_data['success'] or not result_data['data']:
+        return f"Không có dữ liệu cho ngày {result_data['date']} ({result_data['day_of_week']})"
+    
+    # Tạo header bảng
+    headers = ["STT", "Mã CK", "Sàn", "Ngày GDKHQ", "Nội dung", "Cổ tức"]
+    table_data = [headers]
+    
+    # Thêm dữ liệu
+    for event in result_data['data']:
+        table_data.append([
+            event['stt'],
+            event['ma_ck'],
+            event['san'],
+            event['ngay_gdkhq'],
+            event['noi_dung'],
+            event['co_tuc']
+        ])
+    
+    # Tính độ rộng cột
+    col_widths = [max(len(str(row[i])) for row in table_data) for i in range(len(headers))]
+    
+    # Tạo bảng
+    table_str = f"Danh sách sự kiện ngày {result_data['date']} ({result_data['day_of_week']}):\n"
+    table_str += "=" * (sum(col_widths) + len(headers) * 3 - 1) + "\n"
+    
+    for i, row in enumerate(table_data):
+        table_str += " | ".join(f"{row[j]:<{col_widths[j]}}" for j in range(len(headers))) + "\n"
+        if i == 0:  # Sau header
+            table_str += "=" * (sum(col_widths) + len(headers) * 3 - 1) + "\n"
+    
+    table_str += f"\nTổng cộng: {result_data['total_events']} sự kiện"
+    table_str += f"\nMã CK: {', '.join(result_data['stock_codes'])}"
+    
+    return table_str
 
-@app.route('/events', methods=['GET'])
-def get_events():
+def save_to_file(result_data, output_path=None):
+    """
+    Lưu kết quả vào file JSON
+    """
+    if output_path is None:
+        target_date = datetime.strptime(result_data['date'], '%d/%m/%Y')
+        output_path = f"stock_events_{target_date.strftime('%Y%m%d')}.json"
+    
+    with open(output_path, 'w', encoding='utf-8') as f:
+        json.dump(result_data, f, ensure_ascii=False, indent=2)
+    
+    return output_path
+
+def main():
+    parser = argparse.ArgumentParser(description='Scrape stock events from VietStock')
+    parser.add_argument('--date', '-d', type=str, 
+                       help='Ngày cần lấy dữ liệu (YYYY-MM-DD, DD/MM/YYYY, DD-MM-YYYY, today, tomorrow, yesterday)')
+    parser.add_argument('--output', '-o', type=str, 
+                       help='File đầu ra (JSON)')
+    parser.add_argument('--format', '-f', choices=['table', 'json', 'both'], default='table',
+                       help='Định dạng output: table (bảng), json, hoặc both')
+    parser.add_argument('--save', '-s', action='store_true',
+                       help='Lưu kết quả vào file JSON')
+    
+    args = parser.parse_args()
+    
     try:
-        date_param = request.args.get('date')
+        # Lấy ngày mục tiêu
+        target_date = get_target_date(args.date)
         
-        if not date_param:
-            return jsonify({
-                'error': 'Thiếu tham số date. Ví dụ: /events?date=2024-01-15'
-            }), 400
+        # Scrape dữ liệu
+        print(f"Đang lấy dữ liệu cho ngày {target_date.strftime('%d/%m/%Y')}...", file=sys.stderr)
+        result = scrape_stock_events(target_date)
         
-        target_date = parse_date_string(date_param)
-        result = scrape_codes(target_date)
+        # Lưu file nếu được yêu cầu
+        if args.save or args.output:
+            file_path = save_to_file(result, args.output)
+            print(f"Đã lưu kết quả vào: {file_path}", file=sys.stderr)
         
-        if result['success']:
-            return jsonify(result)
-        else:
-            return jsonify(result), 404
-            
-    except ValueError as e:
-        return jsonify({
-            'error': str(e)
-        }), 400
+        # Output theo format được chọn
+        if args.format in ['table', 'both']:
+            print(format_table_output(result))
+        
+        if args.format in ['json', 'both']:
+            if args.format == 'both':
+                print("\n" + "="*50 + " JSON OUTPUT " + "="*50)
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+        
+        # Exit code
+        sys.exit(0 if result['success'] else 1)
+        
     except Exception as e:
-        return jsonify({
-            'error': f'Lỗi server: {str(e)}'
-        }), 500
+        print(f"Lỗi: {str(e)}", file=sys.stderr)
+        sys.exit(1)
 
-@app.route('/events/today', methods=['GET'])
-def get_today_events():
-    try:
-        target_date = get_target_date("today")
-        result = scrape_codes(target_date)
-        
-        if result['success']:
-            return jsonify(result)
-        else:
-            return jsonify(result), 404
-            
-    except Exception as e:
-        return jsonify({
-            'error': f'Lỗi server: {str(e)}'
-        }), 500
-
-@app.route('/events/tomorrow', methods=['GET'])
-def get_tomorrow_events():
-    try:
-        target_date = get_target_date("tomorrow")
-        result = scrape_codes(target_date)
-        
-        if result['success']:
-            return jsonify(result)
-        else:
-            return jsonify(result), 404
-            
-    except Exception as e:
-        return jsonify({
-            'error': f'Lỗi server: {str(e)}'
-        }), 500
-
-@app.route('/health', methods=['GET'])
-def health_check():
-    return jsonify({
-        'status': 'healthy',
-        'timestamp': datetime.now().isoformat()
-    })
-
-if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 8080))
-    app.run(host='0.0.0.0', port=port, debug=False)
+if __name__ == "__main__":
+    main()
